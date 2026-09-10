@@ -271,6 +271,11 @@ where
                             cookie.set_domain(domain);
                         }
 
+                        // Preserve the configured Secure and HttpOnly attributes. Otherwise
+                        // `__Host-`/`__Secure-`-prefixed cookies without Secure may be rejected.
+                        cookie.set_secure(session_config.secure);
+                        cookie.set_http_only(session_config.http_only);
+
                         cookie_controller.remove(&cookies, cookie);
                     }
 
@@ -610,6 +615,17 @@ mod tests {
     }
 
     async fn noop_handler(_: Request<Body>) -> anyhow::Result<Response<Body>> {
+        Ok(Response::new(Body::empty()))
+    }
+
+    async fn flush_handler(req: Request<Body>) -> anyhow::Result<Response<Body>> {
+        let session = req
+            .extensions()
+            .get::<Session>()
+            .ok_or(anyhow!("Missing session"))?;
+
+        session.flush().await?;
+
         Ok(Response::new(Body::empty()))
     }
 
@@ -1023,6 +1039,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secure_removal_test() -> anyhow::Result<()> {
+        let session_store = MemoryStore::default();
+        let session_layer = SessionManagerLayer::new(session_store.clone()).with_secure(true);
+        let svc = ServiceBuilder::new()
+            .layer(session_layer)
+            .service_fn(handler);
+
+        let req = Request::builder().body(Body::empty())?;
+        let res = svc.oneshot(req).await?;
+
+        let session_cookie = response_cookie(&res)?;
+
+        let flush_layer = SessionManagerLayer::new(session_store).with_secure(true);
+        let flush_svc = ServiceBuilder::new()
+            .layer(flush_layer)
+            .service_fn(flush_handler);
+
+        let req = Request::builder()
+            .header(http::header::COOKIE, cookie_request_value(&session_cookie))
+            .body(Body::empty())?;
+        let res = flush_svc.oneshot(req).await?;
+
+        let removal_cookie = response_cookie(&res)?;
+        assert_eq!(removal_cookie.secure(), Some(true));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_only_removal_test() -> anyhow::Result<()> {
+        let session_store = MemoryStore::default();
+        let session_layer = SessionManagerLayer::new(session_store.clone()).with_http_only(true);
+        let svc = ServiceBuilder::new()
+            .layer(session_layer)
+            .service_fn(handler);
+
+        let req = Request::builder().body(Body::empty())?;
+        let res = svc.oneshot(req).await?;
+        let session_cookie = response_cookie(&res)?;
+
+        let flush_layer = SessionManagerLayer::new(session_store).with_http_only(true);
+        let flush_svc = ServiceBuilder::new()
+            .layer(flush_layer)
+            .service_fn(flush_handler);
+
+        let req = Request::builder()
+            .header(http::header::COOKIE, cookie_request_value(&session_cookie))
+            .body(Body::empty())?;
+        let res = flush_svc.oneshot(req).await?;
+
+        let removal_cookie = response_cookie(&res)?;
+        assert_eq!(removal_cookie.http_only(), Some(true));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_only_disabled_removal_test() -> anyhow::Result<()> {
+        let session_store = MemoryStore::default();
+        let session_layer = SessionManagerLayer::new(session_store.clone()).with_http_only(false);
+        let svc = ServiceBuilder::new()
+            .layer(session_layer)
+            .service_fn(handler);
+
+        let req = Request::builder().body(Body::empty())?;
+        let res = svc.oneshot(req).await?;
+        let session_cookie = response_cookie(&res)?;
+
+        let flush_layer = SessionManagerLayer::new(session_store).with_http_only(false);
+        let flush_svc = ServiceBuilder::new()
+            .layer(flush_layer)
+            .service_fn(flush_handler);
+
+        let req = Request::builder()
+            .header(http::header::COOKIE, cookie_request_value(&session_cookie))
+            .body(Body::empty())?;
+        let res = flush_svc.oneshot(req).await?;
+
+        let removal_cookie = response_cookie(&res)?;
+        assert_eq!(removal_cookie.http_only(), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insecure_removal_test() -> anyhow::Result<()> {
+        let session_store = MemoryStore::default();
+        let session_layer = SessionManagerLayer::new(session_store.clone()).with_secure(false);
+        let svc = ServiceBuilder::new()
+            .layer(session_layer)
+            .service_fn(handler);
+
+        let req = Request::builder().body(Body::empty())?;
+        let res = svc.oneshot(req).await?;
+
+        let session_cookie = response_cookie(&res)?;
+
+        let flush_layer = SessionManagerLayer::new(session_store).with_secure(false);
+        let flush_svc = ServiceBuilder::new()
+            .layer(flush_layer)
+            .service_fn(flush_handler);
+
+        let req = Request::builder()
+            .header(http::header::COOKIE, cookie_request_value(&session_cookie))
+            .body(Body::empty())?;
+        let res = flush_svc.oneshot(req).await?;
+
+        let removal_cookie = response_cookie(&res)?;
+
+        assert_eq!(removal_cookie.secure(), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn path_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
         let session_layer = SessionManagerLayer::new(session_store).with_path("/foo/bar");
@@ -1097,6 +1228,19 @@ mod tests {
         res.headers()
             .get(http::header::SET_COOKIE)
             .is_some_and(|set_cookie| set_cookie.to_str().is_ok_and(matcher))
+    }
+
+    fn response_cookie(res: &Response<Body>) -> anyhow::Result<Cookie<'static>> {
+        let value = res
+            .headers()
+            .get(http::header::SET_COOKIE)
+            .ok_or(anyhow!("Missing Set-Cookie header"))?;
+
+        Ok(Cookie::parse(value.to_str()?.to_owned())?.into_owned())
+    }
+
+    fn cookie_request_value(cookie: &Cookie<'_>) -> String {
+        format!("{}={}", cookie.name(), cookie.value())
     }
 
     fn cookie_has_expected_max_age(res: &Response<Body>, expected_value: i64) -> bool {
